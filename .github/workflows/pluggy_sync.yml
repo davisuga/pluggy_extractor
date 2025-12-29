@@ -1,0 +1,32 @@
+name: pluggy-sync
+
+on:
+  schedule:
+    - cron: '15 5 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PLUGGY_CLIENT_ID: ${{ secrets.PLUGGY_CLIENT_ID }}
+      PLUGGY_CLIENT_SECRET: ${{ secrets.PLUGGY_CLIENT_SECRET }}
+      PLUGGY_ITEM_IDS: ${{ secrets.PLUGGY_ITEM_IDS }}
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
+      S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+      S3_REGION: ${{ secrets.S3_REGION }}
+      S3_PREFIX: ${{ secrets.S3_PREFIX }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run sync
+        run: cargo run -p api --bin pluggy_sync
