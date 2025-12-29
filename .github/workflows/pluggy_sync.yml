@@ -22,10 +22,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Cache pluggy_sync binary
+        id: bin-cache
+        uses: actions/cache@v4
+        with:
+          path: target/release/pluggy_sync
+          key: pluggy-sync-bin-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'packages/api/src/**', 'pluggy_rust/src/**') }}
+
       - name: Install Rust
+        if: steps.bin-cache.outputs.cache-hit != 'true'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry
+        if: steps.bin-cache.outputs.cache-hit != 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -33,18 +42,10 @@ jobs:
             ~/.cargo/git
           key: pluggy-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Cache pluggy_sync binary
-        id: bin-cache
-        uses: actions/cache@v4
-        with:
-          path: target/debug/pluggy_sync
-          key: pluggy-sync-bin-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'packages/api/src/**', 'pluggy_rust/src/**') }}
-
       - name: Build binary if missing
+        if: steps.bin-cache.outputs.cache-hit != 'true'
         run: |
-          if [ ! -x target/debug/pluggy_sync ]; then
-            cargo build -p api --bin pluggy_sync --locked
-          fi
+          cargo build -p api --bin pluggy_sync --locked --release
 
       - name: Run sync
-        run: target/debug/pluggy_sync
+        run: target/release/pluggy_sync
