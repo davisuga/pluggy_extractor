@@ -75,7 +75,18 @@ async fn upload_dir_to_s3(base_dir: &PathBuf) -> Result<()> {
     let bucket = env::var("S3_BUCKET").context("S3_BUCKET is required")?;
     let prefix = env::var("S3_PREFIX").unwrap_or_else(|_| "pluggy_sync".to_string());
     let region = env::var("S3_REGION").unwrap_or_else(|_| "us-west-001".to_string());
-    let endpoint = env::var("S3_ENDPOINT").ok();
+    let endpoint = env::var("S3_ENDPOINT")
+        .ok()
+        .and_then(|value| {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+                Some(trimmed)
+            } else {
+                Some(format!("https://{trimmed}"))
+            }
+        });
 
     let mut config_loader =
         aws_config::defaults(BehaviorVersion::latest()).region(Region::new(region));
