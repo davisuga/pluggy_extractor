@@ -64,8 +64,12 @@ async fn main() -> Result<()> {
     upload_dir_to_s3(&base_dir).await?;
 
     println!(
-        "sync complete: accounts={}, account_details={}, transactions={}",
-        stats.accounts, stats.account_details, stats.transactions
+        "sync complete: accounts={}, account_details={}, transactions={}, investments={}, investment_transactions={}",
+        stats.accounts,
+        stats.account_details,
+        stats.transactions,
+        stats.investments,
+        stats.investment_transactions
     );
 
     Ok(())

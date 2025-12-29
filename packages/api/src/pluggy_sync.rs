@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use pluggy_rust::{
-    apis::{account_api, auth_api, configuration, transaction_api},
+    apis::{account_api, auth_api, configuration, investment_api, transaction_api},
     models,
 };
 use serde::Serialize;
@@ -43,6 +43,8 @@ pub struct SyncStats {
     pub accounts: usize,
     pub account_details: usize,
     pub transactions: usize,
+    pub investments: usize,
+    pub investment_transactions: usize,
 }
 
 impl SyncStats {
@@ -50,6 +52,8 @@ impl SyncStats {
         self.accounts += other.accounts;
         self.account_details += other.account_details;
         self.transactions += other.transactions;
+        self.investments += other.investments;
+        self.investment_transactions += other.investment_transactions;
     }
 }
 
@@ -63,6 +67,13 @@ pub trait SyncSink: Send + Sync {
         account_id: &str,
         transactions: &[models::Transaction],
     ) -> Result<()>;
+    async fn write_investments(&self, investments: &[models::Investment]) -> Result<()>;
+    async fn write_investment_transactions(
+        &self,
+        item_id: &str,
+        investment_id: &str,
+        transactions: &[models::InvestmentTransaction],
+    ) -> Result<()>;
     async fn finish(&self) -> Result<()>;
 }
 
@@ -71,6 +82,8 @@ pub struct JsonlFileSink {
     accounts: Mutex<BufWriter<File>>,
     account_details: Mutex<BufWriter<File>>,
     transactions: Mutex<BufWriter<File>>,
+    investments: Mutex<BufWriter<File>>,
+    investment_transactions: Mutex<BufWriter<File>>,
 }
 
 impl JsonlFileSink {
@@ -88,12 +101,20 @@ impl JsonlFileSink {
         let transactions = File::create(base_dir.join("transactions.jsonl"))
             .await
             .context("open transactions.jsonl")?;
+        let investments = File::create(base_dir.join("investments.jsonl"))
+            .await
+            .context("open investments.jsonl")?;
+        let investment_transactions = File::create(base_dir.join("investment_transactions.jsonl"))
+            .await
+            .context("open investment_transactions.jsonl")?;
 
         Ok(Self {
             base_dir,
             accounts: Mutex::new(BufWriter::new(accounts)),
             account_details: Mutex::new(BufWriter::new(account_details)),
             transactions: Mutex::new(BufWriter::new(transactions)),
+            investments: Mutex::new(BufWriter::new(investments)),
+            investment_transactions: Mutex::new(BufWriter::new(investment_transactions)),
         })
     }
 
@@ -158,10 +179,40 @@ impl SyncSink for JsonlFileSink {
         Ok(())
     }
 
+    async fn write_investments(&self, investments: &[models::Investment]) -> Result<()> {
+        Self::write_json_lines(&self.investments, investments.to_vec()).await
+    }
+
+    async fn write_investment_transactions(
+        &self,
+        item_id: &str,
+        investment_id: &str,
+        transactions: &[models::InvestmentTransaction],
+    ) -> Result<()> {
+        let records = transactions.iter().map(|transaction| InvestmentTransactionRecord {
+            item_id,
+            investment_id,
+            transaction,
+        });
+
+        let mut buf = Vec::new();
+        for record in records {
+            let mut line = serde_json::to_vec(&record)?;
+            buf.append(&mut line);
+            buf.push(b'\n');
+        }
+
+        let mut guard = self.investment_transactions.lock().await;
+        guard.write_all(&buf).await?;
+        Ok(())
+    }
+
     async fn finish(&self) -> Result<()> {
         Self::flush_writer(&self.accounts).await?;
         Self::flush_writer(&self.account_details).await?;
         Self::flush_writer(&self.transactions).await?;
+        Self::flush_writer(&self.investments).await?;
+        Self::flush_writer(&self.investment_transactions).await?;
         Ok(())
     }
 }
@@ -171,6 +222,13 @@ struct TransactionRecord<'a> {
     item_id: &'a str,
     account_id: &'a str,
     transaction: &'a models::Transaction,
+}
+
+#[derive(Serialize)]
+struct InvestmentTransactionRecord<'a> {
+    item_id: &'a str,
+    investment_id: &'a str,
+    transaction: &'a models::InvestmentTransaction,
 }
 
 pub async fn fetch_api_key(client_id: uuid::Uuid, client_secret: String) -> Result<String> {
@@ -227,8 +285,7 @@ async fn sync_item(
     item_id: &str,
     options: &SyncOptions,
 ) -> Result<SyncStats> {
-    let accounts_response =
-        account_api::accounts_list(&config, item_id, None).await?;
+    let accounts_response = account_api::accounts_list(&config, item_id, None).await?;
     let accounts = accounts_response.results.unwrap_or_default();
     if !accounts.is_empty() {
         sink.write_accounts(&accounts).await?;
@@ -238,6 +295,12 @@ async fn sync_item(
         accounts: accounts.len(),
         ..Default::default()
     };
+
+    let investments = fetch_investments(&config, item_id, options).await?;
+    if !investments.is_empty() {
+        sink.write_investments(&investments).await?;
+    }
+    stats.investments = investments.len();
 
     let mut set = JoinSet::new();
     for account in accounts {
@@ -249,6 +312,18 @@ async fn sync_item(
         set.spawn(async move {
             let _permit = semaphore.acquire_owned().await?;
             sync_account(config, sink, account, &options).await
+        });
+    }
+
+    for investment in investments {
+        let config = config.clone();
+        let sink = sink.clone();
+        let semaphore = semaphore.clone();
+        let options = options.clone();
+
+        set.spawn(async move {
+            let _permit = semaphore.acquire_owned().await?;
+            sync_investment_transactions(config, sink, investment, &options).await
         });
     }
 
@@ -298,6 +373,90 @@ async fn sync_account(
         sink.write_transactions(&item_id, &account_id, &page_resp.results)
             .await?;
         stats.transactions += page_resp.results.len();
+
+        if page >= page_resp.total_pages {
+            break;
+        }
+        page += 1.0;
+
+        if !options.pause_between_pages.is_zero() {
+            sleep(options.pause_between_pages).await;
+        }
+    }
+
+    Ok(stats)
+}
+
+async fn fetch_investments(
+    config: &configuration::Configuration,
+    item_id: &str,
+    options: &SyncOptions,
+) -> Result<Vec<models::Investment>> {
+    let mut investments = Vec::new();
+    let mut page = 1.0;
+
+    loop {
+        let page_resp = investment_api::investments_list(
+            config,
+            item_id,
+            None,
+            Some(options.page_size),
+            Some(page),
+        )
+        .await?;
+
+        let mut results = page_resp.results.unwrap_or_default();
+        if results.is_empty() {
+            break;
+        }
+        investments.append(&mut results);
+
+        let total_pages = page_resp.total_pages.unwrap_or(page);
+        if page >= total_pages {
+            break;
+        }
+        page += 1.0;
+
+        if !options.pause_between_pages.is_zero() {
+            sleep(options.pause_between_pages).await;
+        }
+    }
+
+    Ok(investments)
+}
+
+async fn sync_investment_transactions(
+    config: Arc<configuration::Configuration>,
+    sink: Arc<dyn SyncSink>,
+    investment: models::Investment,
+    options: &SyncOptions,
+) -> Result<SyncStats> {
+    let investment_id = investment.id.clone();
+    let item_id = investment.item_id.to_string();
+
+    let mut page = 1.0;
+    let mut stats = SyncStats::default();
+
+    loop {
+        let page_resp = investment_api::investment_transactions_list(
+            &config,
+            &investment_id,
+            Some(options.page_size),
+            Some(page),
+        )
+        .await?;
+
+        if page_resp.results.is_empty() {
+            break;
+        }
+
+        sink.write_investment_transactions(
+            &item_id,
+            &investment_id,
+            &page_resp.results,
+        )
+        .await?;
+        stats.investment_transactions += page_resp.results.len();
 
         if page >= page_resp.total_pages {
             break;
