@@ -25,8 +25,26 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: pluggy-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache pluggy_sync binary
+        id: bin-cache
+        uses: actions/cache@v4
+        with:
+          path: target/debug/pluggy_sync
+          key: pluggy-sync-bin-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'packages/api/src/**', 'pluggy_rust/src/**') }}
+
+      - name: Build binary if missing
+        run: |
+          if [ ! -x target/debug/pluggy_sync ]; then
+            cargo build -p api --bin pluggy_sync --locked
+          fi
 
       - name: Run sync
-        run: cargo run -p api --bin pluggy_sync
+        run: target/debug/pluggy_sync
