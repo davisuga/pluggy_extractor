@@ -90,7 +90,7 @@ impl JsonlFileSink {
     pub async fn new(base_dir: PathBuf) -> Result<Self> {
         fs::create_dir_all(&base_dir)
             .await
-            .with_context(|| format!("create output dir {:?}", base_dir))?;
+            .with_context(|| format!("create output dir {base_dir:?}"))?;
 
         let accounts = File::create(base_dir.join("accounts.jsonl"))
             .await

@@ -1,8 +1,20 @@
-use std::{env, path::PathBuf, sync::Arc, time::Duration, time::SystemTime};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+    time::SystemTime,
+};
 
 use anyhow::{Context, Result};
 use aws_config::{BehaviorVersion, Region};
-use aws_sdk_s3::{config::Builder as S3ConfigBuilder, primitives::ByteStream, Client as S3Client};
+use aws_sdk_s3::{
+    config::Builder as S3ConfigBuilder,
+    primitives::ByteStream,
+    types::{Delete, ObjectIdentifier},
+    Client as S3Client,
+};
 use tokio::fs;
 
 use api::pluggy_sync::{self, JsonlFileSink, SyncOptions, SyncSink};
@@ -62,6 +74,7 @@ async fn main() -> Result<()> {
     sink.finish().await?;
 
     upload_dir_to_s3(&base_dir).await?;
+    prune_local_runs(&base_dir, max_runs_from_env()).await?;
 
     println!(
         "sync complete: accounts={}, account_details={}, transactions={}, investments={}, investment_transactions={}",
@@ -106,7 +119,7 @@ async fn upload_dir_to_s3(base_dir: &PathBuf) -> Result<()> {
 
     let mut entries = fs::read_dir(base_dir)
         .await
-        .with_context(|| format!("read dir {:?}", base_dir))?;
+        .with_context(|| format!("read dir {base_dir:?}"))?;
 
     let run_name = base_dir
         .file_name()
@@ -127,7 +140,7 @@ async fn upload_dir_to_s3(base_dir: &PathBuf) -> Result<()> {
         let key = format!("{prefix}/{run_name}/{file_name}");
         let body = ByteStream::from_path(&path)
             .await
-            .with_context(|| format!("open file {:?}", path))?;
+            .with_context(|| format!("open file {path:?}"))?;
 
         client
             .put_object()
@@ -141,5 +154,153 @@ async fn upload_dir_to_s3(base_dir: &PathBuf) -> Result<()> {
 
     println!("uploaded to s3://{bucket}/{prefix}/{run_name}");
 
+    prune_old_s3_runs(&client, &bucket, &prefix, max_runs_from_env()).await?;
+
     Ok(())
+}
+
+fn max_runs_from_env() -> usize {
+    env::var("PLUGGY_MAX_RUNS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(30)
+}
+
+async fn prune_local_runs(base_dir: &Path, keep: usize) -> Result<()> {
+    let parent = base_dir
+        .parent()
+        .context("local base dir missing parent")?;
+    let mut entries = fs::read_dir(parent)
+        .await
+        .with_context(|| format!("read local dir {parent:?}"))?;
+
+    let mut runs = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let name = match path.file_name().and_then(|v| v.to_str()) {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+
+        if let Ok(run_id) = name.parse::<u64>() {
+            runs.push((run_id, path));
+        }
+    }
+
+    runs.sort_by_key(|(run_id, _)| *run_id);
+    if runs.len() <= keep {
+        return Ok(());
+    }
+
+    let remove_count = runs.len() - keep;
+    for (_, path) in runs.into_iter().take(remove_count) {
+        fs::remove_dir_all(&path)
+            .await
+            .with_context(|| format!("remove local run {path:?}"))?;
+    }
+
+    Ok(())
+}
+
+async fn prune_old_s3_runs(
+    client: &S3Client,
+    bucket: &str,
+    prefix: &str,
+    keep: usize,
+) -> Result<()> {
+    let mut continuation = None;
+    let mut run_keys: HashMap<String, Vec<String>> = HashMap::new();
+    let normalized_prefix = prefix.trim_matches('/');
+    let prefix_path = format!("{normalized_prefix}/");
+
+    loop {
+        let mut req = client.list_objects_v2().bucket(bucket).prefix(&prefix_path);
+        if let Some(token) = continuation.take() {
+            req = req.continuation_token(token);
+        }
+        let resp = req.send().await?;
+
+        for obj in resp.contents() {
+            let Some(key) = obj.key() else {
+                continue;
+            };
+            let Some(run_id) = extract_run_id(&prefix_path, key) else {
+                continue;
+            };
+            run_keys
+                .entry(run_id)
+                .or_default()
+                .push(key.to_string());
+        }
+
+        if resp.is_truncated().unwrap_or(false) {
+            continuation = resp.next_continuation_token().map(|v| v.to_string());
+        } else {
+            break;
+        }
+    }
+
+    if run_keys.len() <= keep {
+        return Ok(());
+    }
+
+    let mut numeric_runs: Vec<(u64, String)> = run_keys
+        .keys()
+        .filter_map(|run| run.parse::<u64>().ok().map(|id| (id, run.clone())))
+        .collect();
+    numeric_runs.sort_by_key(|(id, _)| *id);
+
+    if numeric_runs.len() <= keep {
+        return Ok(());
+    }
+
+    let keep_set: HashSet<String> = numeric_runs
+        .into_iter()
+        .rev()
+        .take(keep)
+        .map(|(_, run)| run)
+        .collect();
+
+    let mut delete_keys = Vec::new();
+    for (run_id, keys) in run_keys {
+        if keep_set.contains(&run_id) {
+            continue;
+        }
+        delete_keys.extend(keys);
+    }
+
+    for chunk in delete_keys.chunks(1000) {
+        let objects = chunk
+            .iter()
+            .map(|key| ObjectIdentifier::builder().key(key).build())
+            .collect::<Result<Vec<_>, _>>()
+            .context("build delete object identifiers")?;
+
+        let delete = Delete::builder()
+            .set_objects(Some(objects))
+            .build()
+            .context("build delete payload")?;
+        client
+            .delete_objects()
+            .bucket(bucket)
+            .delete(delete)
+            .send()
+            .await
+            .context("delete old s3 runs")?;
+    }
+
+    Ok(())
+}
+
+fn extract_run_id(prefix_path: &str, key: &str) -> Option<String> {
+    let rest = key.strip_prefix(prefix_path)?;
+    let (run_id, _) = rest.split_once('/')?;
+    if run_id.is_empty() {
+        return None;
+    }
+    Some(run_id.to_string())
 }
