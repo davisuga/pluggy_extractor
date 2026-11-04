@@ -49,3 +49,13 @@ jobs:
 
       - name: Run sync
         run: target/release/pluggy_sync
+
+      - name: Update optional Google Drive snapshot
+        if: vars.GOOGLE_DRIVE_ENABLED == 'true'
+        env:
+          GOOGLE_DRIVE_ENABLED: ${{ vars.GOOGLE_DRIVE_ENABLED }}
+          GOOGLE_DRIVE_CLIENT_ID: ${{ secrets.GOOGLE_DRIVE_CLIENT_ID }}
+          GOOGLE_DRIVE_CLIENT_SECRET: ${{ secrets.GOOGLE_DRIVE_CLIENT_SECRET }}
+          GOOGLE_DRIVE_REFRESH_TOKEN: ${{ secrets.GOOGLE_DRIVE_REFRESH_TOKEN }}
+          GOOGLE_DRIVE_FILE_ID: ${{ secrets.GOOGLE_DRIVE_FILE_ID }}
+        run: python3 scripts/drive_export.py
